@@ -1,0 +1,53 @@
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: PodSecurityPreventPrivilegedContainers
+metadata:
+  name: podsecuritypreventprivilegedcontainers
+  labels:
+    helm.sh/chart: cls-gatekeeper-4.40.0
+    app.kubernetes.io/name: cls-gatekeeper
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    argocd.argoproj.io/sync-wave: '1'
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  match:
+    kinds:
+    - apiGroups:
+      - ""
+      - apps
+      - batch
+      kinds:
+      - Deployment
+      - Pod
+      - CronJob
+      - DaemonSet
+      - Job
+      - ReplicaSet
+      - ReplicationController
+      - StatefulSet
+    excludedNamespaces:
+      - "dynatrace"
+      - "falcon-system"
+      - "illumio-system"
+      - "kube-system"
+      - "openshift-apiserver"
+      - "openshift-cluster-csi-drivers"
+      - "openshift-cluster-node-tuning-operator"
+      - "openshift-cluster-version"
+      - "openshift-dns"
+      - "openshift-etcd"
+      - "openshift-image-registry"
+      - "openshift-kube-apiserver"
+      - "openshift-kube-controller-manager"
+      - "openshift-kube-scheduler"
+      - "openshift-machine-config-operator"
+      - "openshift-monitoring"
+      - "openshift-multus"
+      - "openshift-oauth-apiserver"
+      - "openshift-ovn-kubernetes"
+      - "openshift-vsphere-infra"
+      - "portworx"
+      - "traceableai"
+      - "falcon-operator"
+  enforcementAction: "deny"
