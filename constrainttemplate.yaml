@@ -1,0 +1,427 @@
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+    name: podsecuritypreventprivilegedcontainers
+spec:
+  crd:
+    spec:
+      names:
+        kind: PodSecurityPreventPrivilegedContainers
+      validation:
+        openAPIV3Schema:
+          properties:
+            exemptImages:
+              items:
+                properties:
+                  image:
+                    type: string
+                  namespace:
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\*|-\*)?$
+                    type: string
+                required:
+                - image
+                type: object
+              type: array
+          type: object
+
+  targets:
+    - libs:
+      - |-
+          package lib.exemptions
+          
+          import data.lib.helpers
+          
+          # Accepts parameters as 
+          # exemptImages:
+          #   Only Exempt in a specific namespace
+          #   - image: artifactory.aexp.com/nginx
+          #     namespace: nginx-foo
+          #   Exempt in all namespaces
+          #   - image: artifactory.aexp.com/foobar 
+          container_check(container) {
+          	exempt_images := object.get(object.get(input, "parameters", {}), "exemptImages", [])
+          	img := container.image
+          	exemption := exempt_images[_]
+          	matches_container_exemption(img, exemption)
+          }
+          
+          matches_container_exemption(img, exemption) {
+          	not exemption.namespace
+          	startswith(img, exemption.image)
+          }
+          
+          matches_container_exemption(img, exemption) {
+          	exemption.namespace
+          	startswith(img, exemption.image)
+          	helpers.namespace == exemption.namespace
+          }
+          
+          container_exempt(container) {
+          	not container_check(container)
+          }
+          
+
+      - |-
+          package lib.helpers
+          
+          ## Classify Request Types
+          
+          # Matches Gatekeeper Admission, Audit, and Gator requests
+          default is_gatekeeper = false
+          
+          is_gatekeeper {
+          	has_field(input, "review")
+          }
+          
+          # Matches Gatekeeper Admission Requests
+          default is_gatekeeper_admission = false
+          
+          is_gatekeeper_admission {
+          	has_field(input, "review")
+          	input.review.operation != ""
+          }
+          
+          # Matches Gatekeeper Audit
+          # We make an assumption that live objects have managedFields 
+          default is_gatekeeper_audit = false
+          
+          is_gatekeeper_audit {
+          	is_audit
+          	has_field(input.review.object.metadata, "managedFields")
+          }
+          
+          # Matches Gator Requests
+          # We make an assumption that gator objects don't have managedFields
+          default is_gator_audit = false
+          
+          is_gator_audit {
+          	is_audit
+          	not input.review.object.metadata.managedFields
+          }
+          
+          # Matches Gatekeeper Audit and Gator Requests
+          default is_audit = false
+          
+          is_audit {
+          	has_field(input, "review")
+          	input.review.operation == ""
+          }
+          
+          # Only used for tests from kube-review, Gatekeeper and Gator do not use this
+          default is_testing_admission_review = false
+          
+          is_testing_admission_review {
+          	input.kind == "AdmissionReview"
+          }
+          
+          ## Get Objects for Different Request Types
+          
+          object = input.review.object {
+          	is_gatekeeper
+          }
+          
+          object = input {
+          	not is_testing_admission_review
+          	not is_gatekeeper
+          }
+          
+          object = input.request.object {
+          	is_testing_admission_review
+          }
+          
+          default oldObject = null
+          
+          oldObject = input.request.oldObject {
+          	input.request.operation == "UPDATE"
+          	is_testing_admission_review
+          }
+          
+          oldObject = input.review.oldObject {
+          	input.review.operation == "UPDATE"
+          	is_gatekeeper_admission
+          }
+          
+          ## Get Kind for Different Request Types
+          
+          kind = input.request.kind.kind {
+          	is_testing_admission_review
+          }
+          
+          kind = object.kind {
+          	not is_testing_admission_review
+          }
+          
+          kindMatchAny(kinds) {
+          	kind == kinds[_]
+          }
+          
+          ## Get Namespace
+          
+          # If namespace is not defined request defaults the 'default' namespace
+          default namespace = "default"
+          
+          # If an input is of the kind AdmissionReview, the namespace is defined at input.request.namespace
+          namespace = input.request.namespace {
+          	is_testing_admission_review
+          }
+          
+          # If an input is not of the kind AdmissionReview (for conftest), the namespace is defined at input.metadata.namespace
+          namespace = object.metadata.namespace {
+          	kind != "Namespace"
+          	not is_testing_admission_review
+          }
+          
+          # If an input is not of the kind AdmissionReview (for conftest) AND it the object has a kind of Namespace, the namespace is defined at input.metadata.name
+          namespace = object.metadata.name {
+          	kind == "Namespace"
+          	not is_testing_admission_review
+          }
+          
+          ## Match Operations
+          
+          operationMatch(op) {
+          	is_testing_admission_review
+          	op == input.request.operation
+          }
+          
+          operationMatch(op) {
+          	is_gatekeeper
+          	op == input.review.operation
+          }
+          
+          # For audit runs the operation will be the empty string
+          operationMatch(op) {
+          	is_gatekeeper
+          	input.review.operation == ""
+          }
+          
+          operationMatch(op) {
+          	not is_testing_admission_review
+          	not is_gatekeeper
+          }
+          
+          operationMatchAny(ops) {
+          	operationMatch(ops[_])
+          }
+          
+          isCreateUpdate {
+          	operationMatchAny(["CREATE", "UPDATE"])
+          }
+          
+          ## New Match Operations functions to use before we remove the other operations
+          
+          operationMatchNew(op) {
+          	is_gatekeeper
+          	op == input.review.operation
+          }
+          
+          # For audit runs the operation will be the empty string
+          operationMatchNew(op) {
+          	is_gatekeeper
+          	input.review.operation == ""
+          }
+          
+          operationMatchAnyNew(ops) {
+          	operationMatchNew(ops[_])
+          }
+          
+          newCreateUpdate {
+          	operationMatchAnyNew(["CREATE", "UPDATE"])
+          }
+          
+          
+          # Pod-specific Helpers
+          
+          pod_creators = {"Deployment", "CronJob", "DaemonSet", "Job", "ReplicaSet", "ReplicationController", "StatefulSet"}
+          
+          is_pod_creator {
+          	pod_creators[kind]
+          }
+          
+          is_pod {
+          	kind == "Pod"
+          }
+          
+          is_pod_type {
+          	is_pod_creator
+          }
+          
+          is_pod_type {
+          	is_pod
+          }
+          
+          pod_containers(pod) = all_containers {
+          	keys = {"containers", "initContainers", "ephemeralContainers"}
+          	all_containers = [c | keys[k]; c = pod.spec[k][_]]
+          }
+          
+          containers[container] {
+          	all_containers = pod_containers(pod)
+          	container = all_containers[_]
+          }
+          
+          pod = p {
+          	is_pod_creator
+          	p = object.spec.template
+          }
+          
+          pod = p {
+          	is_pod
+          	p = object
+          }
+          
+          oldObjectPod = p {
+          	is_pod_creator
+          	p = oldObject.spec.template
+          }
+          
+          oldObjectPod = p {
+          	is_pod
+          	p = oldObject
+          }
+          
+          has_field(obj, field) {
+          	_ := obj[field]
+          }
+          
+          get_default(obj, param, _default) = out {
+          	out = obj[param]
+          }
+          
+          get_default(obj, param, _default) = out {
+          	not obj[param]
+          	not obj[param] == false
+          	out = _default
+          }
+          
+          ## Gloomesh Helpers
+          
+          # This rule will return True for Gatekeeper admission and audit requests in clusters where Gloo is enabled
+          isGloomeshInstalled {
+          	is_gatekeeper_admission
+          	data.inventory.cluster["apiextensions.k8s.io/v1"].CustomResourceDefinition["istiooperators.install.istio.io"]
+          }
+          
+          isGloomeshInstalled {
+          	is_gatekeeper_audit
+          	data.inventory.cluster["apiextensions.k8s.io/v1"].CustomResourceDefinition["istiooperators.install.istio.io"]
+          }
+          
+          isGloomeshInstalled {
+          	not is_gatekeeper_admission
+          	not is_gatekeeper_audit
+          }
+          
+          ## Format Error Messages
+          
+          # This rule adds the UID (unique ID) for all Admission Requests to help developers and operations with troubleshooting
+          format(error_msg, policy_name) = output_msg {
+          	not is_gatekeeper_admission
+          	output_msg = error_msg
+          }
+          
+          format(error_msg, policy_name) = output_msg {
+          	is_gatekeeper_admission
+          	uid_msg = sprintf("Visit go.aexp.com/admission-%s for more information. Request ID for troubleshooting: %s", [policy_name, input.review.uid])
+          	output_msg = concat(" ", [error_msg, uid_msg])
+          }
+          
+
+      - |-
+          package lib.updateFilter
+          
+          import data.lib.helpers
+          
+          ## Filter Out Reporting for Update Operations with No Relevant Changes
+          
+          # These rules use the object.get function, which accepts keys as an array 
+          # For example, valueSamePodType(["spec", "securityContext"]) will check for differences in spec.securityContext
+          
+          # Returns True if a inputted key has the same value between the new and old objects in an UPDATE operation
+          # This rule starts at input.review.object
+          valueSame(variable) {
+          	helpers.is_gatekeeper_admission
+          	"UPDATE" == input.review.operation
+          	object.get(input.review.oldObject, variable, null) == object.get(input.review.object, variable, null)
+          }
+          
+          valueDifferent(variable) {
+          	not valueSame(variable)
+          }
+          
+          valuesDifferent(variables) {
+          	variable = variables[_]
+          	valueDifferent(variable)
+          }
+          
+          # Returns True if a inputted key has the same value between the new and old objects in an UPDATE operation, specifically for Pods and objects that create Pods
+          # This rule starts at input.review.object for Pods and input.review.object.spec.template for objects that create Pods
+          valueSamePodType(variable) {
+          	helpers.is_gatekeeper_admission
+          	"UPDATE" == input.review.operation
+          	object.get(helpers.pod, variable, null) == object.get(helpers.oldObjectPod, variable, null)
+          }
+          
+          valueDifferentPodType(variable) {
+          	not valueSamePodType(variable)
+          }
+          
+          valuesDifferentPodType(variables) {
+          	variable = variables[_]
+          	valueDifferentPodType(variable)
+          }
+          
+          # Returns True if a inputted key has the same value between the new and old objects in an UPDATE operation, specifically for containers in Pods and objects that create Pods
+          # This rule starts at input.review.object.spec.containers[_] for Pods and input.review.object.spec.template.spec.containers[_] for objects that create Pods
+          valueSameContainer(variable) {
+          	helpers.is_gatekeeper_admission
+          	"UPDATE" == input.review.operation
+          	newPodContainers = helpers.pod_containers(helpers.pod)
+          	oldPodContainers = helpers.pod_containers(helpers.oldObjectPod)
+          	count(newPodContainers) == count(oldPodContainers)
+          	not differentContainerValues(newPodContainers, oldPodContainers, variable)
+          }
+          
+          differentContainerValues(newPodContainers, oldPodContainers, variable) {
+          	some i
+          	not object.get(newPodContainers[i], variable, null) == object.get(oldPodContainers[i], variable, null)
+          }
+          
+          valueDifferentContainer(variable) {
+          	not valueSameContainer(variable)
+          }
+          
+          valuesDifferentContainer(variables) {
+          	variable = variables[_]
+          	valueDifferentContainer(variable)
+          }
+          
+        
+      rego: |-
+        package policies.PodSecurityPreventPrivilegedContainers
+        
+        import data.lib.exemptions
+        import data.lib.helpers
+        import data.lib.updateFilter
+        
+        violation[{"msg": msg}] {
+          # Match Operations
+          helpers.isCreateUpdate
+          updateFilter.valueDifferentContainer(["securityContext", "privileged"])
+          helpers.containers[container]
+          exemptions.container_exempt(container)
+        
+          # Policy Logic
+          has_privileged_container(container)
+        
+          # Build Error Message
+          msg := helpers.format(sprintf("Privileged container running at %s. Privileged containers are disallowed.", [container.name]), "PodSecurityPreventPrivilegedContainers")
+        }
+        
+        has_privileged_container(container) {
+          var := container.securityContext
+          var.privileged == true
+        }
+        
+        
+      target: admission.k8s.gatekeeper.sh
